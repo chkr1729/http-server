@@ -4,6 +4,7 @@ import re
 import sys
 import os
 import argparse
+import gzip
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, Tuple
 
@@ -33,27 +34,38 @@ def parse_request(
 
 
 def format_response(
-    status_code: str, body: str | bytes = "", content_type: str = "text/plain"
+    status_code: str,
+    body: str | bytes = "",
+    content_type: str = "text/plain",
+    supported_encodings: Optional[set[str]] = None,
 ) -> bytes:
     """Formats an HTTP response with given status, body, and headers."""
+
     if isinstance(body, str):
         response_body = body.encode("utf-8")  # Convert string to bytes
     else:  # body is guaranteed to be bytes here
         response_body = body
 
-    headers = (
-        f"HTTP/1.1 {status_code}\r\n"
-        f"Content-Type: {content_type}\r\n"
-        f"Content-Length: {len(response_body)}\r\n"
-        "\r\n"
-    ).encode("utf-8")
-    return headers + response_body
+    headers = [
+        f"HTTP/1.1 {status_code}",
+        f"Content-Type: {content_type}",
+    ]
+
+    if "gzip" in (supported_encodings or set()):
+        response_body = gzip.compress(response_body)
+        headers.append("Content-Encoding: gzip")
+
+    headers.append(f"Content-Length: {len(response_body)}")
+    headers.append("\r\n")  # End of headers
+
+    return "\r\n".join(headers).encode("utf-8") + response_body
 
 
 def handle_file_upload(
     request_data: str, path: str, base_directory: str, headers: dict[str, str]
 ) -> bytes:
     """Handles file upload via POST request to `/files/{filename}`."""
+
     match = re.match(r"^/files/([^/]+)$", path)
     if not match:
         return format_response("400 Bad Request", "Invalid file request")
@@ -92,69 +104,113 @@ def handle_file_upload(
         return format_response("500 Internal Server Error", "File write error")
 
 
-def handle_file_request(path: str, base_directory: str) -> bytes:
-    """Handles file retrieval from the specified directory securely."""
+def handle_file_request(
+    path: str, base_directory: str, supported_encodings: set[str]
+) -> bytes:
+    """Handles file retrieval from the specified directory securely with optional compression."""
+
     match = re.match(r"^/files/([^/]+)$", path)
-    response = None  # Store the response instead of returning early
+    response = None
 
     if not match:
-        response = format_response("400 Bad Request", "Invalid file request")
+        response = format_response(
+            "400 Bad Request", "Invalid file request", "text/plain", supported_encodings
+        )
     else:
         filename = match.group(1)
         file_path = os.path.abspath(os.path.join(base_directory, filename))
 
         if not file_path.startswith(os.path.abspath(base_directory)):
-            response = format_response("403 Forbidden", "Access Denied")
+            response = format_response(
+                "403 Forbidden", "Access Denied", "text/plain", supported_encodings
+            )
         elif not os.path.isfile(file_path):
-            response = format_response("404 Not Found")
+            response = format_response(
+                "404 Not Found", "File Not Found", "text/plain", supported_encodings
+            )
         else:
             try:
                 with open(file_path, "rb") as f:
                     file_content = f.read()
                 response = format_response(
-                    "200 OK", file_content, "application/octet-stream"
+                    "200 OK",
+                    file_content,
+                    "application/octet-stream",
+                    supported_encodings,
                 )
             except FileNotFoundError:
-                response = format_response("404 Not Found")
+                response = format_response(
+                    "404 Not Found",
+                    "File not found Error",
+                    "text/plain",
+                    supported_encodings,
+                )
             except PermissionError:
-                response = format_response("403 Forbidden", "Permission Denied")
+                response = format_response(
+                    "403 Forbidden",
+                    "Permission Denied",
+                    "text/plain",
+                    supported_encodings,
+                )
             except OSError as e:
                 logging.error("OS error reading file %s: %s", filename, e)
-                response = format_response("500 Internal Server Error", "OS Error")
+                response = format_response(
+                    "500 Internal Server Error",
+                    "OS Error",
+                    "text/plain",
+                    supported_encodings,
+                )
             except Exception as e:  # pylint: disable=broad-exception-caught
                 logging.critical(
                     "Unexpected error reading file %s: %s", filename, e, exc_info=True
                 )
-                response = format_response("500 Internal Server Error", "Server Error")
+                response = format_response(
+                    "500 Internal Server Error",
+                    "Server Error",
+                    "text/plain",
+                    supported_encodings,
+                )
     return response
 
 
 def handle_request(client_socket: socket.socket, base_directory: str) -> None:
     """Handles an incoming HTTP request (GET/POST) and sends an appropriate response."""
     try:
-        request_data = client_socket.recv(4096).decode(
-            "utf-8"
-        )  # Increased buffer size for POST data
+        request_data = client_socket.recv(4096).decode("utf-8")
         if not request_data:
-            return  # Empty request, do nothing
+            return
 
         method, path, headers = parse_request(request_data)
-        headers = headers or {}  # Ensure headers is always a dictionary
+        headers = headers or {}
+
+        accept_encoding = headers.get("accept-encoding", "").lower()
+        supported_encodings = set(accept_encoding.replace(" ", "").split(","))
 
         # Handle GET requests
         if method == "GET":
             if path == "/":
-                response = format_response("200 OK")
-            elif path and (match := re.match(r"^/echo/(.+)$", path)):
-                response = format_response("200 OK", match.group(1))
+                response = format_response(
+                    "200 OK", "", "text/plain", supported_encodings
+                )
+            elif match := re.match(r"^/echo/(.+)$", path or ""):
+                response = format_response(
+                    "200 OK", match.group(1), "text/plain", supported_encodings
+                )
             elif path == "/user-agent":
                 response = format_response(
-                    "200 OK", headers.get("user-agent", "Unknown")
+                    "200 OK",
+                    headers.get("user-agent", "Unknown"),
+                    "text/plain",
+                    supported_encodings,
                 )
             elif path and path.startswith("/files/"):
-                response = handle_file_request(path, base_directory)
+                response = handle_file_request(
+                    path, base_directory, supported_encodings
+                )
             else:
-                response = format_response("404 Not Found", "Not Found")
+                response = format_response(
+                    "404 Not Found", "Not Found", "text/plain", supported_encodings
+                )
 
         # Handle POST requests
         elif method == "POST" and path and path.startswith("/files/"):
