@@ -50,6 +50,48 @@ def format_response(
     return headers + response_body
 
 
+def handle_file_upload(
+    request_data: str, path: str, base_directory: str, headers: dict[str, str]
+) -> bytes:
+    """Handles file upload via POST request to `/files/{filename}`."""
+    match = re.match(r"^/files/([^/]+)$", path)
+    if not match:
+        return format_response("400 Bad Request", "Invalid file request")
+
+    filename = match.group(1)
+    file_path = os.path.abspath(os.path.join(base_directory, filename))
+
+    # Prevent directory traversal attacks
+    if not file_path.startswith(os.path.abspath(base_directory)):
+        return format_response("403 Forbidden", "Access Denied")
+
+    # Validate Content-Length header
+    content_length = headers.get("content-length")
+    if content_length is None or not content_length.isdigit():
+        return format_response(
+            "411 Length Required", "Content-Length header missing or invalid"
+        )
+
+    content_length = int(content_length)
+
+    # Extract request body (POST data)
+    request_parts = request_data.split("\r\n\r\n", 1)
+    if len(request_parts) < 2:
+        return format_response("400 Bad Request", "Missing request body")
+
+    request_body = request_parts[1][
+        :content_length
+    ]  # Ensure we only take the expected length
+
+    try:
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write(request_body)
+        return format_response("201 Created")  # Success response
+    except OSError as e:
+        logging.error("Error writing file %s: %s", filename, e)
+        return format_response("500 Internal Server Error", "File write error")
+
+
 def handle_file_request(path: str, base_directory: str) -> bytes:
     """Handles file retrieval from the specified directory securely."""
     match = re.match(r"^/files/([^/]+)$", path)
@@ -84,34 +126,43 @@ def handle_file_request(path: str, base_directory: str) -> bytes:
                     "Unexpected error reading file %s: %s", filename, e, exc_info=True
                 )
                 response = format_response("500 Internal Server Error", "Server Error")
-
-    return response  # Single return statement
+    return response
 
 
 def handle_request(client_socket: socket.socket, base_directory: str) -> None:
-    """Handles an incoming HTTP request and sends an appropriate response."""
+    """Handles an incoming HTTP request (GET/POST) and sends an appropriate response."""
     try:
-        request_data = client_socket.recv(1024).decode("utf-8")
+        request_data = client_socket.recv(4096).decode(
+            "utf-8"
+        )  # Increased buffer size for POST data
         if not request_data:
             return  # Empty request, do nothing
 
         method, path, headers = parse_request(request_data)
         headers = headers or {}  # Ensure headers is always a dictionary
 
-        if not method or not path:
-            response = format_response("400 Bad Request", "Invalid Request")
-        elif method != "GET":
-            response = format_response("405 Method Not Allowed", "Only GET supported")
-        elif path == "/":
-            response = format_response("200 OK")
-        elif match := re.match(r"^/echo/(.+)$", path):  # Using the walrus operator
-            response = format_response("200 OK", match.group(1))
-        elif path == "/user-agent":
-            response = format_response("200 OK", headers.get("user-agent", "Unknown"))
-        elif path.startswith("/files/"):
-            response = handle_file_request(path, base_directory)
+        # Handle GET requests
+        if method == "GET":
+            if path == "/":
+                response = format_response("200 OK")
+            elif path and (match := re.match(r"^/echo/(.+)$", path)):
+                response = format_response("200 OK", match.group(1))
+            elif path == "/user-agent":
+                response = format_response(
+                    "200 OK", headers.get("user-agent", "Unknown")
+                )
+            elif path and path.startswith("/files/"):
+                response = handle_file_request(path, base_directory)
+            else:
+                response = format_response("404 Not Found", "Not Found")
+
+        # Handle POST requests
+        elif method == "POST" and path and path.startswith("/files/"):
+            response = handle_file_upload(request_data, path, base_directory, headers)
         else:
-            response = format_response("404 Not Found", "Not Found")
+            response = format_response(
+                "405 Method Not Allowed", "Only GET and POST supported"
+            )
 
         client_socket.sendall(response)
     except Exception as e:  # pylint: disable=broad-exception-caught
@@ -119,7 +170,7 @@ def handle_request(client_socket: socket.socket, base_directory: str) -> None:
         response = format_response("500 Internal Server Error", "Server Error")
         client_socket.sendall(response)
     finally:
-        client_socket.close()  # Ensure the connection is closed
+        client_socket.close()
 
 
 def start_server(base_directory: str) -> None:
